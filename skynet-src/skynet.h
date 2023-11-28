@@ -14,7 +14,7 @@
 #define PTYPE_HARBOR 5
 #define PTYPE_SOCKET 6
 // read lualib/skynet.lua examples/simplemonitor.lua
-#define PTYPE_ERROR 7	
+#define PTYPE_ERROR 7
 // read lualib/skynet.lua lualib/mqueue.lua lualib/snax.lua
 #define PTYPE_RESERVED_QUEUE 8
 #define PTYPE_RESERVED_DEBUG 9
@@ -40,5 +40,9 @@ void skynet_callback(struct skynet_context * context, void *ud, skynet_cb cb);
 uint32_t skynet_current_handle(void);
 uint64_t skynet_now(void);
 void skynet_debug_memory(const char *info);	// for debug use, output current service memory to stderr
+
+const char* skynet_modname(struct skynet_context* context);
+typedef int (*skynet_exec_cb)(struct skynet_context * context, void *ud);
+int skynet_exec(uint32_t handle, skynet_exec_cb cb, void* ud);
 
 #endif

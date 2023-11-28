@@ -4,12 +4,15 @@
 #include <lua.h>
 #include <lualib.h>
 #include <lauxlib.h>
+#include <lstate.h>
 
 #include <assert.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <time.h>
+
+#include <ldebug.h>
 
 #if defined(__APPLE__)
 #include <mach/task.h>
@@ -22,6 +25,17 @@
 // #define DEBUG_LOG
 
 #define MEMORY_WARNING_REPORT (1024 * 1024 * 32)
+#define MAX_BUFFER_SZ (4 * 1024)
+enum sigal_type {
+	SIGNAL_TRAP,
+	SIGNAL_MEMORY,
+	SIGNAL_TRACES,
+};
+
+#define MASK_RANGE (~0 >> 1)
+#define SETTING_HOOK_BIT ~MASK_RANGE
+#define SIG2MASK(x) (1 << (x))
+#define lowbit(u) ((u) & -(u))
 
 struct snlua {
 	lua_State * L;
@@ -30,7 +44,10 @@ struct snlua {
 	size_t mem_report;
 	size_t mem_limit;
 	lua_State * activeL;
-	ATOM_INT trap;
+	ATOM_ULONG signal_mask;  // set_hook的类型，使用位运算
+
+	ATOM_INT traces_status;  // 函数堆栈信息的长度
+	char traces[MAX_BUFFER_SZ]; // 函数堆栈信息
 };
 
 // LUA_CACHELIB may defined in patched lua for shared proto
@@ -45,7 +62,7 @@ cleardummy(lua_State *L) {
   return 0;
 }
 
-static int 
+static int
 codecache(lua_State *L) {
 	luaL_Reg l[] = {
 		{ "clear", cleardummy },
@@ -60,6 +77,61 @@ codecache(lua_State *L) {
 
 #endif
 
+
+int currentpc (CallInfo *ci) {
+  lua_assert(isLua(ci));
+  return pcRel(ci->u.l.savedpc, ci_func(ci)->p);
+}
+
+int getcurrentline2 (CallInfo *ci) {
+	//   return luaG_getfuncline(ci_func(ci)->p, currentpc(ci));
+	return 0;
+}
+
+
+size_t
+ltrace_info(lua_State *L, char *buffer, size_t sz, int level) {
+	buffer[0] = '0';
+	if(!buffer || sz <= 1) {
+		return 0;
+	}
+
+	const char *head = buffer;
+	CallInfo *ci;
+	for (ci = L->ci; ci != &L->base_ci; ci = ci->previous) {
+		TValue *func = s2v(ci->func.p);
+		int t = ttypetag(func);
+		int r;
+		switch(t) {
+			case LUA_VCCL:  // C closure
+				r = snprintf(buffer, sz, "[C] %p\n", clCvalue(func)->f);
+				printf("C closure\n");
+				break;
+			case LUA_VLCF: // light C function
+				r = snprintf(buffer, sz, "[F] %p\n", fvalue(func));
+				printf("light C function\n");
+				break;
+			case LUA_VLCL: { // Lua function
+				Proto *p = clLvalue(func)->p;
+				r = snprintf(buffer, sz, "[L] %s:%d\n", getstr(p->source), getcurrentline2(ci));
+				printf("[L] %s:%d\n", getstr(p->source), getcurrentline2(ci));
+				break;
+			default:
+				r = snprintf(buffer, sz, "[U]: %d\n", t);
+				printf("default\n");
+				break;
+			}
+		}
+		if(r > 0 && (size_t)r < sz){
+			buffer += r;
+			sz -= r;
+		}else{
+			break;
+		}
+	}
+	return buffer - head;
+}
+
 static void
 signal_hook(lua_State *L, lua_Debug *ar) {
 	void *ud = NULL;
@@ -67,16 +139,28 @@ signal_hook(lua_State *L, lua_Debug *ar) {
 	struct snlua *l = (struct snlua *)ud;
 
 	lua_sethook (L, NULL, 0, 0);
-	if (ATOM_LOAD(&l->trap)) {
-		ATOM_STORE(&l->trap , 0);
-		luaL_error(L, "signal 0");
+	unsigned long signal_mask = ATOM_FAND(&l->signal_mask, 0);
+	while(signal_mask){
+		unsigned long mask = lowbit(signal_mask);
+		switch(mask){
+			case SIG2MASK(SIGNAL_TRAP):
+				luaL_error(L, "signal 0");
+				break;
+			case SIG2MASK(SIGNAL_TRACES):
+				if (ATOM_LOAD(&l->traces_status) == 0) {
+					const int traces_status = ltrace_info(l->activeL, l->traces, MAX_BUFFER_SZ, 1);
+					ATOM_STORE(&l->traces_status, traces_status);
+				}
+				break;
+		};
+		signal_mask ^= mask;
 	}
 }
 
 static void
 switchL(lua_State *L, struct snlua *l) {
 	l->activeL = L;
-	if (ATOM_LOAD(&l->trap)) {
+	if (ATOM_LOAD(&l->signal_mask) && lua_gethook(L) == NULL) {
 		lua_sethook(L, signal_hook, LUA_MASKCOUNT, 1);
 	}
 }
@@ -88,9 +172,9 @@ lua_resumeX(lua_State *L, lua_State *from, int nargs, int *nresults) {
 	struct snlua *l = (struct snlua *)ud;
 	switchL(L, l);
 	int err = lua_resume(L, from, nargs, nresults);
-	if (ATOM_LOAD(&l->trap)) {
-		// wait for lua_sethook. (l->trap == -1)
-		while (ATOM_LOAD(&l->trap) >= 0) ;
+	if (ATOM_LOAD(&l->signal_mask)) {
+		// wait for lua_sethook. (l->signal_mask == -1)
+		while (ATOM_LOAD(&l->signal_mask) >= 0) ;
 	}
 	switchL(from, l);
 	return err;
@@ -353,7 +437,7 @@ init_profile(lua_State *L) {
 
 /// end of coroutine
 
-static int 
+static int
 traceback (lua_State *L) {
 	const char *msg = lua_tostring(L, 1);
 	if (msg)
@@ -506,7 +590,7 @@ snlua_create(void) {
 	l->mem_limit = 0;
 	l->L = lua_newstate(lalloc, l);
 	l->activeL = NULL;
-	ATOM_INIT(&l->trap , 0);
+	ATOM_INIT(&l->signal_mask , 0);
 	return l;
 }
 
@@ -519,16 +603,37 @@ snlua_release(struct snlua *l) {
 void
 snlua_signal(struct snlua *l, int signal) {
 	skynet_error(l->ctx, "recv a signal %d", signal);
-	if (signal == 0) {
-		if (ATOM_LOAD(&l->trap) == 0) {
-			// only one thread can set trap ( l->trap 0->1 )
-			if (!ATOM_CAS(&l->trap, 0, 1))
-				return;
-			lua_sethook (l->activeL, signal_hook, LUA_MASKCOUNT, 1);
-			// finish set ( l->trap 1 -> -1 )
-			ATOM_CAS(&l->trap, 1, -1);
+	if (signal == SIGNAL_TRAP) {
+		if(!ATOM_FOR(&(l)->signal_mask, SIG2MASK(SIGNAL_TRAP))) {
+			ATOM_FOR(&(l)->signal_mask, SETTING_HOOK_BIT);
+			lua_sethook(l->activeL, signal_hook, LUA_MASKCOUNT, 1);
+			ATOM_FAND(&(l)->signal_mask, MASK_RANGE);
 		}
 	} else if (signal == 1) {
 		skynet_error(l->ctx, "Current Memory %.3fK", (float)l->mem / 1024);
+	} else if (signal == SIGNAL_TRACES) {
+		if(!ATOM_FOR(&(l)->signal_mask, SIG2MASK(SIGNAL_TRACES))) {
+			ATOM_FOR(&(l)->signal_mask, SETTING_HOOK_BIT);
+			lua_sethook(l->activeL, signal_hook, LUA_MASKCOUNT, 1);
+			ATOM_FAND(&(l)->signal_mask, MASK_RANGE);
+		}
 	}
+}
+
+
+int
+snlua_pop_traces(struct snlua *l, lua_State *L) {
+	const int traces_status = ATOM_LOAD(&l->traces_status);
+	if(traces_status > 0 && ATOM_CAS(&l->traces_status, traces_status, -1)){
+		lua_pushlstring(L, l->traces, traces_status);
+		__sync_synchronize();
+		l->traces_status = 0;
+		return 1;
+	}
+	return 0;
+}
+
+void
+snlua_set_traces(struct snlua *l){
+	snlua_signal(l, 2);
 }

@@ -28,4 +28,6 @@ void skynet_initthread(int m);
 
 void skynet_profile_enable(int enable);
 
+void* skynet_context_instance(struct skynet_context* ctx);
+
 #endif

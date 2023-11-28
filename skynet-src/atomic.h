@@ -22,13 +22,14 @@
 #define ATOM_FADD(ptr,n) __sync_fetch_and_add(ptr, n)
 #define ATOM_FSUB(ptr,n) __sync_fetch_and_sub(ptr, n)
 #define ATOM_FAND(ptr,n) __sync_fetch_and_and(ptr, n)
+#define ATOM_FOR(ptr,n) __sync_fetch_and_or(ptr, n)
 
 #else
 
 #if defined (__cplusplus)
 #include <atomic>
 #define STD_ std::
-#define atomic_value_type_(p, v) decltype((p)->load())(v) 
+#define atomic_value_type_(p, v) decltype((p)->load())(v)
 #else
 #include <stdatomic.h>
 #define STD_
@@ -68,6 +69,7 @@ ATOM_CAS_POINTER(STD_ atomic_uintptr_t *ptr, uintptr_t oval, uintptr_t nval) {
 #define ATOM_FADD(ptr,n) STD_ atomic_fetch_add(ptr, atomic_value_type_(ptr, n))
 #define ATOM_FSUB(ptr,n) STD_ atomic_fetch_sub(ptr, atomic_value_type_(ptr, n))
 #define ATOM_FAND(ptr,n) STD_ atomic_fetch_and(ptr, atomic_value_type_(ptr, n))
+#define ATOM_FOR(ptr,n) STD_ atomic_fetch_or(ptr, atomic_value_type_(ptr, n))
 
 #endif
 
